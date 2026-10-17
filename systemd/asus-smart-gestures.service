@@ -20,7 +20,7 @@ ProtectControlGroups=true
 NoNewPrivileges=true
 MemoryDenyWriteExecute=true
 RestrictRealtime=true
-DeviceAllow=/dev/input/* rw
+DeviceAllow=char-input rw
 DeviceAllow=/dev/uinput rw
 
 [Install]

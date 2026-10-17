@@ -39,7 +39,7 @@ ProtectControlGroups=true       # cgroup hierarchies cannot be modified
 NoNewPrivileges=true            # Child processes cannot escalate privileges
 MemoryDenyWriteExecute=true     # Mitigates W^X memory exploits
 RestrictRealtime=true           # Prevents real-time scheduling abuse
-DeviceAllow=/dev/input/* rw     # Restricts device access strictly to inputs
+DeviceAllow=char-input rw       # Restricts device access strictly to inputs (char-input device group)
 DeviceAllow=/dev/uinput rw      # Restricts device access strictly to uinput
 ```
 

@@ -1,6 +1,9 @@
 """Unit tests for daemon zone determination and key mapping."""
 
+import os
+import time
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -81,3 +84,34 @@ def test_key_mapping_resolution(mock_touchpad: TouchpadInfo) -> None:
     pos_none, neg_none = daemon._resolve_keys(Action.NONE, invert=False)
     assert pos_none is None
     assert neg_none is None
+
+
+def test_daemon_idle_duration_timeout(mock_touchpad: TouchpadInfo) -> None:
+    """Verify that daemon terminates promptly after max_duration even without input events."""
+    r, w = os.pipe()
+    try:
+        cfg = GestureConfig(dry_run=True)
+        daemon = GestureDaemon(touchpad=mock_touchpad, config=cfg)
+        with patch("os.open", return_value=r):
+            start = time.monotonic()
+            daemon.run(max_duration=0.2)
+            elapsed = time.monotonic() - start
+            assert 0.18 <= elapsed <= 1.0
+    finally:
+        os.close(w)
+
+
+def test_daemon_exits_on_eof(mock_touchpad: TouchpadInfo) -> None:
+    """Verify that daemon exits immediately on EOF instead of spinning in an infinite loop."""
+    r, w = os.pipe()
+    os.close(w)  # Immediately close write end to trigger EOF on read
+    try:
+        cfg = GestureConfig(dry_run=True)
+        daemon = GestureDaemon(touchpad=mock_touchpad, config=cfg)
+        with patch("os.open", return_value=r):
+            start = time.monotonic()
+            daemon.run(max_duration=5.0)
+            elapsed = time.monotonic() - start
+            assert elapsed < 1.0
+    finally:
+        pass

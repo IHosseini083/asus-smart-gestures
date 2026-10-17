@@ -2,6 +2,7 @@
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 from . import __version__
@@ -39,7 +40,18 @@ def run_calibrate(daemon: GestureDaemon, duration: float = 30.0) -> None:
     print("=" * 70)
     print("Touch and slide along the trackpad edges. Press Ctrl+C to stop.\n")
 
+    last_print = 0.0
+    last_zone: Zone | None = None
+
     def on_touch(zone: Zone, x: int, y: int) -> None:
+        nonlocal last_print, last_zone
+        now = time.monotonic()
+        # Rate-limit center wiggles to ~10Hz, but show edge updates promptly
+        if zone == Zone.NONE and last_zone == Zone.NONE and (now - last_print) < 0.1:
+            return
+        last_print = now
+        last_zone = zone
+
         x_pct = ((x - tp.x_min) / tp.width) * 100.0 if tp.width > 0 else 0.0
         y_pct = ((y - tp.y_min) / tp.height) * 100.0 if tp.height > 0 else 0.0
 
@@ -131,6 +143,10 @@ def main() -> None:
         cfg.dry_run = True
     if args.device:
         cfg.device = str(args.device)
+
+    # Reconfigure log level from config if not overridden by CLI flags
+    if not (args.verbose or args.quiet):
+        setup_logging(level=cfg.log_level)
 
     try:
         touchpad = find_touchpad(cfg.device)

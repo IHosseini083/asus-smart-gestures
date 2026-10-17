@@ -4,6 +4,7 @@ import atexit
 import contextlib
 import fcntl
 import os
+import select
 import signal
 import struct
 import time
@@ -210,14 +211,31 @@ class GestureDaemon:
 
         try:
             while self._running:
-                if deadline and time.monotonic() > deadline:
-                    break
+                if deadline:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    timeout = min(0.5, remaining)
+                else:
+                    timeout = 0.5
+
+                try:
+                    r, _, _ = select.select([self._fd], [], [], timeout)
+                except (InterruptedError, OSError):
+                    continue
+
+                if not r:
+                    continue
 
                 try:
                     data = os.read(self._fd, EVENT_SIZE)
                 except OSError as err:
                     if self._running:
                         self.logger.error("Read error on %s: %s", self.touchpad.path, err)
+                    break
+
+                if not data:
+                    self.logger.info("Touchpad device closed or disconnected (EOF)")
                     break
 
                 if len(data) < EVENT_SIZE:
@@ -275,6 +293,9 @@ class GestureDaemon:
                     if gesture is not None and cur_slot == gesture.slot_id:
                         slot_data = slots[cur_slot]
                         cx, cy = slot_data.x, slot_data.y
+
+                        if event_callback:
+                            event_callback(gesture.zone, cx, cy)
 
                         if gesture.zone in (Zone.LEFT, Zone.RIGHT):
                             action = (
