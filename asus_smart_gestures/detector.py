@@ -1,58 +1,73 @@
-"""Universal touchpad detection and geometry query for ASUS laptops."""
+"""Hardware discovery and validation for ASUS and compatible touchpads."""
 
 import fcntl
-import glob
-import os
+import stat
 import struct
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from pathlib import Path
 
-EVIOCGNAME_LEN = 256
-EVIOCGPROP_LEN = 8
+from .constants import (
+    ABS_MT_POSITION_X,
+    ABS_MT_POSITION_Y,
+    BTN_TOUCH,
+    EV_ABS,
+    EV_KEY,
+    EVIOCGABS,
+    EVIOCGBIT,
+    EVIOCGNAME,
+    EVIOCGPROP,
+    INPUT_PROP_BUTTONPAD,
+    INPUT_PROP_POINTER,
+)
+from .logging import get_logger
 
-
-def _ioc(dir_: int, type_: str, nr: int, size: int) -> int:
-    return (dir_ << 30) | (size << 16) | (ord(type_) << 8) | nr
-
-
-def EVIOCGNAME(length: int) -> int:
-    return _ioc(2, "E", 0x06, length)
-
-
-def EVIOCGABS(axis: int) -> int:
-    return _ioc(2, "E", 0x40 + axis, 24)
-
-
-def EVIOCGBIT(ev_type: int, length: int) -> int:
-    return _ioc(2, "E", 0x20 + ev_type, length)
-
-
-def EVIOCGPROP(length: int) -> int:
-    return _ioc(2, "E", 0x09, length)
+DEV_INPUT_DIR = Path("/dev/input")
+MAX_NAME_LEN = 256
+PROP_LEN = 8
 
 
-EV_KEY = 0x01
-EV_ABS = 0x03
+@dataclass(slots=True, frozen=True)
+class TouchpadInfo:
+    """Discovered touchpad hardware information."""
 
-ABS_MT_POSITION_X = 0x35  # 53
-ABS_MT_POSITION_Y = 0x36  # 54
-BTN_TOUCH = 0x14A         # 330
-INPUT_PROP_POINTER = 0x00
-INPUT_PROP_BUTTONPAD = 0x02
+    path: Path
+    name: str
+    x_min: int
+    x_max: int
+    y_min: int
+    y_max: int
+
+    @property
+    def width(self) -> int:
+        return self.x_max - self.x_min
+
+    @property
+    def height(self) -> int:
+        return self.y_max - self.y_min
+
+
+def _has_bit(buf: bytes | bytearray, bit: int) -> bool:
+    byte_idx = bit // 8
+    bit_idx = bit % 8
+    if byte_idx < len(buf):
+        return bool(buf[byte_idx] & (1 << bit_idx))
+    return False
 
 
 def get_device_name(fd: int) -> str:
+    """Query evdev device name via EVIOCGNAME ioctl."""
+    buf = bytearray(MAX_NAME_LEN)
     try:
-        buf = bytearray(EVIOCGNAME_LEN)
-        fcntl.ioctl(fd, EVIOCGNAME(EVIOCGNAME_LEN), buf)
-        return buf.split(b"\x00", 1)[0].decode(errors="replace")
+        fcntl.ioctl(fd, EVIOCGNAME(MAX_NAME_LEN), buf)
+        return buf.split(b"\x00", 1)[0].decode(errors="replace").strip()
     except OSError:
         return ""
 
 
-def get_abs_info(fd: int, axis: int) -> Optional[Tuple[int, int]]:
-    """Return (min, max) for an absolute axis."""
+def get_abs_range(fd: int, axis: int) -> tuple[int, int] | None:
+    """Retrieve min and max coordinates for an absolute axis."""
+    buf = bytearray(24)
     try:
-        buf = bytearray(24)
         fcntl.ioctl(fd, EVIOCGABS(axis), buf)
         _val, minimum, maximum, _fuzz, _flat, _res = struct.unpack("6i", buf)
         if maximum > minimum:
@@ -62,51 +77,42 @@ def get_abs_info(fd: int, axis: int) -> Optional[Tuple[int, int]]:
     return None
 
 
-def has_bit(buf: bytearray, bit: int) -> bool:
-    byte_idx = bit // 8
-    bit_idx = bit % 8
-    if byte_idx < len(buf):
-        return bool(buf[byte_idx] & (1 << bit_idx))
-    return False
-
-
-def is_touchpad(fd: int, name: str) -> bool:
-    """Determine if device is a multitouch touchpad."""
-    # Check ABS bits
+def is_valid_touchpad(fd: int, name: str) -> bool:
+    """Verify that file descriptor represents a multi-touch trackpad."""
+    # Check absolute axis capabilities
     abs_bits = bytearray(64)
     try:
         fcntl.ioctl(fd, EVIOCGBIT(EV_ABS, len(abs_bits)), abs_bits)
     except OSError:
         return False
 
-    has_mt_x = has_bit(abs_bits, ABS_MT_POSITION_X)
-    has_mt_y = has_bit(abs_bits, ABS_MT_POSITION_Y)
-    if not (has_mt_x and has_mt_y):
+    if not (_has_bit(abs_bits, ABS_MT_POSITION_X) and _has_bit(abs_bits, ABS_MT_POSITION_Y)):
         return False
 
-    # Check KEY bits for BTN_TOUCH
+    # Check key capabilities (must have BTN_TOUCH)
     key_bits = bytearray(96)
     try:
         fcntl.ioctl(fd, EVIOCGBIT(EV_KEY, len(key_bits)), key_bits)
     except OSError:
         return False
 
-    if not has_bit(key_bits, BTN_TOUCH):
+    if not _has_bit(key_bits, BTN_TOUCH):
         return False
 
+    # Filter out touchscreens, tablets, and pens
     name_lower = name.lower()
-    # Explicit exclusion of touchscreen / tablets
-    if "touchscreen" in name_lower or "pen" in name_lower or "tablet" in name_lower:
-        return False
+    for blacklist in ("touchscreen", "pen", "stylus", "tablet", "digitizer"):
+        if blacklist in name_lower:
+            return False
 
     if "touchpad" in name_lower or "trackpad" in name_lower:
         return True
 
     # Check input properties for pointer/buttonpad
-    prop_bits = bytearray(EVIOCGPROP_LEN)
+    prop_bits = bytearray(PROP_LEN)
     try:
-        fcntl.ioctl(fd, EVIOCGPROP(EVIOCGPROP_LEN), prop_bits)
-        if has_bit(prop_bits, INPUT_PROP_POINTER) or has_bit(prop_bits, INPUT_PROP_BUTTONPAD):
+        fcntl.ioctl(fd, EVIOCGPROP(PROP_LEN), prop_bits)
+        if _has_bit(prop_bits, INPUT_PROP_POINTER) or _has_bit(prop_bits, INPUT_PROP_BUTTONPAD):
             return True
     except OSError:
         pass
@@ -114,56 +120,118 @@ def is_touchpad(fd: int, name: str) -> bool:
     return False
 
 
-def scan_touchpads() -> List[Dict[str, any]]:
-    """Scan all /dev/input/event* and return candidate touchpads."""
-    devices = []
-    for path in sorted(glob.glob("/dev/input/event*")):
+def validate_device_path(path: Path | str) -> Path:
+    """Sanitize and validate an input device path.
+
+    Raises:
+        ValueError: If path is not a valid character device or outside /dev/input.
+    """
+    resolved = Path(path).resolve()
+    if not resolved.exists():
+        raise ValueError(f"Device does not exist: {resolved}")
+
+    # Must be a character device
+    try:
+        st = resolved.stat()
+        if not stat.S_ISCHR(st.st_mode):
+            raise ValueError(f"Path is not a character device: {resolved}")
+    except OSError as err:
+        raise ValueError(f"Cannot stat device path {resolved}: {err}") from err
+
+    # Ensure device is within /dev/input
+    if not (resolved.parent == DEV_INPUT_DIR or str(resolved).startswith("/dev/input/")):
+        raise ValueError(f"Device path must be in /dev/input/: {resolved}")
+
+    return resolved
+
+
+def scan_touchpads() -> list[TouchpadInfo]:
+    """Scan /dev/input for all multitouch touchpads."""
+    logger = get_logger()
+    touchpads: list[TouchpadInfo] = []
+
+    if not DEV_INPUT_DIR.is_dir():
+        logger.error("/dev/input directory does not exist")
+        return touchpads
+
+    for path in sorted(DEV_INPUT_DIR.glob("event*")):
         try:
-            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-        except OSError:
-            continue
+            with path.open("rb") as f:
+                fd = f.fileno()
+                name = get_device_name(fd)
+                if is_valid_touchpad(fd, name):
+                    x_range = get_abs_range(fd, ABS_MT_POSITION_X) or (0, 3987)
+                    y_range = get_abs_range(fd, ABS_MT_POSITION_Y) or (0, 2579)
+                    touchpads.append(
+                        TouchpadInfo(
+                            path=path,
+                            name=name,
+                            x_min=x_range[0],
+                            x_max=x_range[1],
+                            y_min=y_range[0],
+                            y_max=y_range[1],
+                        )
+                    )
+        except PermissionError:
+            logger.debug("Permission denied opening %s (requires root/input group)", path)
+        except OSError as err:
+            logger.debug("Error checking %s: %s", path, err)
 
-        try:
-            name = get_device_name(fd)
-            if is_touchpad(fd, name):
-                x_range = get_abs_info(fd, ABS_MT_POSITION_X)
-                y_range = get_abs_info(fd, ABS_MT_POSITION_Y)
-                devices.append({
-                    "path": path,
-                    "name": name,
-                    "x_range": x_range or (0, 3987),
-                    "y_range": y_range or (0, 2579),
-                })
-        finally:
-            os.close(fd)
-
-    return devices
+    return touchpads
 
 
-def find_best_touchpad(preferred_path: Optional[str] = None) -> Tuple[str, str, Tuple[int, int], Tuple[int, int]]:
-    """Select the best touchpad or raise RuntimeError."""
+def find_touchpad(preferred_path: Path | str | None = None) -> TouchpadInfo:
+    """Find the best matching touchpad device.
+
+    Args:
+        preferred_path: Optional path specified in configuration or CLI.
+
+    Returns:
+        TouchpadInfo for the target device.
+
+    Raises:
+        RuntimeError: If device cannot be found or accessed.
+    """
+    logger = get_logger()
+
     if preferred_path:
-        if not os.path.exists(preferred_path):
-            raise RuntimeError(f"Configured device path not found: {preferred_path}")
-        fd = os.open(preferred_path, os.O_RDONLY | os.O_NONBLOCK)
+        valid_path = validate_device_path(preferred_path)
         try:
-            name = get_device_name(fd)
-            x_range = get_abs_info(fd, ABS_MT_POSITION_X) or (0, 3987)
-            y_range = get_abs_info(fd, ABS_MT_POSITION_Y) or (0, 2579)
-            return preferred_path, name, x_range, y_range
-        finally:
-            os.close(fd)
+            with valid_path.open("rb") as f:
+                fd = f.fileno()
+                name = get_device_name(fd)
+                x_range = get_abs_range(fd, ABS_MT_POSITION_X) or (0, 3987)
+                y_range = get_abs_range(fd, ABS_MT_POSITION_Y) or (0, 2579)
+                return TouchpadInfo(
+                    path=valid_path,
+                    name=name,
+                    x_min=x_range[0],
+                    x_max=x_range[1],
+                    y_min=y_range[0],
+                    y_max=y_range[1],
+                )
+        except PermissionError as err:
+            raise RuntimeError(
+                f"Permission denied accessing device {valid_path}. Run with sudo or join the 'input' group."
+            ) from err
+        except OSError as err:
+            raise RuntimeError(f"Failed to access device {valid_path}: {err}") from err
 
-    candidates = scan_touchpads()
-    if not candidates:
-        raise RuntimeError("No multitouch touchpad found in /dev/input/event*")
+    touchpads = scan_touchpads()
+    if not touchpads:
+        raise RuntimeError(
+            "No multitouch touchpad found. Ensure you are running as root or user in the 'input' group."
+        )
 
-    # Priority 1: ASUS-specific touchpad IDs or names
-    for dev in candidates:
-        name = dev["name"].lower()
-        if any(token in name for token in ["asuf", "asce", "asue", "asus", "04f3:"]):
-            return dev["path"], dev["name"], dev["x_range"], dev["y_range"]
+    # Priority 1: ASUS-specific touchpad identifiers
+    asus_identifiers = ("asce", "asuf", "asue", "asus", "04f3:330c")
+    for tp in touchpads:
+        name_lower = tp.name.lower()
+        if any(ident in name_lower for ident in asus_identifiers):
+            logger.debug("Selected ASUS touchpad by identifier match: %s", tp.name)
+            return tp
 
-    # Priority 2: Standard touchpad
-    first = candidates[0]
-    return first["path"], first["name"], first["x_range"], first["y_range"]
+    # Priority 2: Return first candidate
+    selected = touchpads[0]
+    logger.debug("Selected first candidate touchpad: %s", selected.name)
+    return selected

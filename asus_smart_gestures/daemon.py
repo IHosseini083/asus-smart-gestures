@@ -1,159 +1,229 @@
-"""Main gesture daemon tracking touches, zones, and emitting events."""
+"""Core gesture daemon tracking touches, edge zones, and mapping slides to keys."""
 
+import atexit
+import contextlib
 import fcntl
 import os
+import signal
 import struct
 import time
-from typing import Callable, Dict, Optional, Tuple
+from collections.abc import Callable
+from dataclasses import dataclass
+from types import FrameType
 
 from .config import GestureConfig
-from .uinput import (
-    KEY_BRIGHTNESSDOWN,
-    KEY_BRIGHTNESSUP,
-    KEY_NAMES,
-    KEY_NEXTSONG,
-    KEY_PREVIOUSSONG,
-    KEY_VOLUMEDOWN,
-    KEY_VOLUMEUP,
-    UInputDevice,
+from .constants import (
+    ABS_MT_POSITION_X,
+    ABS_MT_POSITION_Y,
+    ABS_MT_SLOT,
+    ABS_MT_TRACKING_ID,
+    EV_ABS,
+    EV_SYN,
+    EVIOCGRAB,
+    INPUT_EVENT_FMT,
+    SYN_REPORT,
+    Action,
+    KeyCode,
+    Zone,
 )
+from .detector import TouchpadInfo
+from .logging import get_logger
+from .uinput import UInputDevice
 
-FMT = "llHHi"
-SZ = struct.calcsize(FMT)
+EVENT_SIZE = struct.calcsize(INPUT_EVENT_FMT)
 
-EV_SYN = 0x00
-EV_KEY = 0x01
-EV_ABS = 0x03
-SYN_REPORT = 0x00
 
-BTN_TOUCH = 0x14A
-ABS_MT_SLOT = 0x2F
-ABS_MT_POSITION_X = 0x35
-ABS_MT_POSITION_Y = 0x36
-ABS_MT_TRACKING_ID = 0x39
+@dataclass(slots=True)
+class TouchSlot:
+    """State for a single multitouch tracking slot."""
 
-EVIOCGRAB = 0x40044590
+    tracking_id: int | None = None
+    x: int = 0
+    y: int = 0
+
+
+@dataclass(slots=True)
+class ActiveGesture:
+    """State for an active edge gesture being tracked."""
+
+    zone: Zone
+    slot_id: int
+    step_ref_y: int
+    step_ref_x: int
+    start_x: int
+    start_y: int
 
 
 class GestureDaemon:
-    """Manages raw evdev stream from touchpad and translates edge slides to keys."""
+    """Monitors raw touchpad input and translates edge slides into system keys."""
 
-    def __init__(
-        self,
-        device_path: str,
-        device_name: str,
-        x_range: Tuple[int, int],
-        y_range: Tuple[int, int],
-        config: GestureConfig,
-    ):
-        self.device_path = device_path
-        self.device_name = device_name
-        self.x_min, self.x_max = x_range
-        self.y_min, self.y_max = y_range
+    def __init__(self, touchpad: TouchpadInfo, config: GestureConfig) -> None:
+        self.touchpad = touchpad
         self.cfg = config
+        self.logger = get_logger()
 
-        # Pad coordinate dimensions
-        width = self.x_max - self.x_min
-        height = self.y_max - self.y_min
+        # Calculate coordinate thresholds from percentages
+        width = touchpad.width
+        height = touchpad.height
 
-        # Calculated pixel thresholds based on config percentages
         self.edge_x = max(1, int((self.cfg.edge_x_percent / 100.0) * width))
-        self.bottom_limit = self.y_max - int((self.cfg.bottom_ignore_percent / 100.0) * height)
+        self.bottom_limit = touchpad.y_max - int((self.cfg.bottom_ignore_percent / 100.0) * height)
         self.step_y = max(1, int((self.cfg.step_travel_percent / 100.0) * height))
 
-        self.top_limit = self.y_min + int((self.cfg.top_edge_percent / 100.0) * height)
+        self.top_limit = touchpad.y_min + int((self.cfg.top_edge_percent / 100.0) * height)
         self.step_x = max(1, int((self.cfg.top_step_travel_percent / 100.0) * width))
 
-        self.uinput: Optional[UInputDevice] = None
-        if not self.cfg.dry_run:
-            self.uinput = UInputDevice(name="asus-smart-gestures")
+        self._uinput: UInputDevice | None = None
+        self._fd: int | None = None
+        self._is_grabbed = False
+        self._running = False
 
-    def _determine_zone(self, x: int, y: int) -> Optional[str]:
-        # Exclude bottom clickpad area
+    def _determine_zone(self, x: int, y: int) -> Zone:
+        """Classify start coordinate into an edge zone or Zone.NONE."""
+        # Bottom exclusion zone (clickpad physical click area)
         if y > self.bottom_limit:
-            return None
+            return Zone.NONE
 
-        # Check top horizontal zone if enabled
-        if self.cfg.enable_top_edge and y < self.top_limit:
-            # If not in the left/right corner strips, it's top
-            if x >= (self.x_min + self.edge_x) and x <= (self.x_max - self.edge_x):
-                return "top"
+        # Top horizontal slider
+        if (
+            self.cfg.enable_top_edge
+            and y < self.top_limit
+            and (self.touchpad.x_min + self.edge_x) <= x <= (self.touchpad.x_max - self.edge_x)
+        ):
+            return Zone.TOP
 
-        # Check left / right vertical zones
-        if x < (self.x_min + self.edge_x):
-            return "left"
-        if x > (self.x_max - self.edge_x):
-            return "right"
+        # Left / right vertical sliders
+        if x < (self.touchpad.x_min + self.edge_x):
+            return Zone.LEFT
+        if x > (self.touchpad.x_max - self.edge_x):
+            return Zone.RIGHT
 
-        return None
+        return Zone.NONE
 
-    def _resolve_keys_for_action(self, action: str, invert: bool) -> Tuple[Optional[int], Optional[int]]:
-        """Return (positive_key, negative_key) for an action."""
-        pos, neg = None, None
-        if action == "volume":
-            pos, neg = KEY_VOLUMEUP, KEY_VOLUMEDOWN
-        elif action == "brightness":
-            pos, neg = KEY_BRIGHTNESSUP, KEY_BRIGHTNESSDOWN
-        elif action == "media":
-            pos, neg = KEY_NEXTSONG, KEY_PREVIOUSSONG
+    def _resolve_keys(self, action: Action, invert: bool) -> tuple[KeyCode | None, KeyCode | None]:
+        """Map action to (up_or_next_key, down_or_prev_key)."""
+        pos: KeyCode | None = None
+        neg: KeyCode | None = None
+
+        if action == Action.VOLUME:
+            pos, neg = KeyCode.VOLUMEUP, KeyCode.VOLUMEDOWN
+        elif action == Action.BRIGHTNESS:
+            pos, neg = KeyCode.BRIGHTNESSUP, KeyCode.BRIGHTNESSDOWN
+        elif action == Action.MEDIA:
+            pos, neg = KeyCode.NEXTSONG, KeyCode.PREVIOUSSONG
 
         if invert and pos is not None and neg is not None:
             return neg, pos
         return pos, neg
 
-    def run(self, max_duration: float = 0.0, event_callback: Optional[Callable[[str, int, int], None]] = None) -> None:
-        """Main event polling loop."""
-        fd = os.open(self.device_path, os.O_RDONLY)
-        deadline = time.monotonic() + max_duration if max_duration > 0 else None
+    def _set_device_grab(self, grab: bool) -> None:
+        """Safely grab or ungrab device, ensuring fail-safe state."""
+        if self._fd is None:
+            return
+        if grab and not self._is_grabbed and not self.cfg.dry_run:
+            try:
+                fcntl.ioctl(self._fd, EVIOCGRAB, 1)
+                self._is_grabbed = True
+                self.logger.debug("Device grabbed (exclusive access active)")
+            except OSError as err:
+                self.logger.warning("Failed to grab device: %s", err)
+        elif not grab and self._is_grabbed:
+            with contextlib.suppress(OSError):
+                fcntl.ioctl(self._fd, EVIOCGRAB, 0)
+            self.logger.debug("Device released (grab released)")
+            self._is_grabbed = False
 
-        slots: Dict[int, Dict[str, any]] = {}
+    def _cleanup(self) -> None:
+        """Guaranteed cleanup hook to prevent leaving touchpad unresponsive."""
+        self._set_device_grab(False)
+        if self._fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(self._fd)
+            self._fd = None
+        if self._uinput is not None:
+            self._uinput.close()
+            self._uinput = None
+
+    def _handle_signal(self, signum: int, _frame: FrameType | None) -> None:
+        """Handle termination signals safely."""
+        self.logger.info("Received signal %d, cleanly exiting...", signum)
+        self._running = False
+
+    def run(
+        self,
+        max_duration: float = 0.0,
+        event_callback: Callable[[Zone, int, int], None] | None = None,
+    ) -> None:
+        """Main event loop processing evdev input."""
+        # Register fail-safe cleanup with atexit and signal handlers
+        atexit.register(self._cleanup)
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, self._handle_signal)
+
+        self.logger.info("Listening on %s (%s)", self.touchpad.path, self.touchpad.name)
+        self.logger.info(
+            "Geometry: X:[%d..%d] Y:[%d..%d] | edge_x=%dpx, bottom_limit=%dpx, step=%dpx",
+            self.touchpad.x_min,
+            self.touchpad.x_max,
+            self.touchpad.y_min,
+            self.touchpad.y_max,
+            self.edge_x,
+            self.bottom_limit,
+            self.step_y,
+        )
+        if self.cfg.dry_run:
+            self.logger.info("DRY RUN ENABLED - no keys will be emitted, no grabs taken.")
+
+        try:
+            self._fd = os.open(self.touchpad.path, os.O_RDONLY)
+        except PermissionError as err:
+            raise PermissionError(
+                f"Cannot open {self.touchpad.path}: permission denied. Run as root or join input group."
+            ) from err
+
+        if not self.cfg.dry_run:
+            self._uinput = UInputDevice(name="asus-smart-gestures")
+
+        slots: dict[int, TouchSlot] = {}
         active_slot = 0
-        track: Optional[Dict[str, any]] = None
-        tracked_slot: Optional[int] = None
-        grabbed = False
+        gesture: ActiveGesture | None = None
+        deadline = time.monotonic() + max_duration if max_duration > 0 else None
+        self._running = True
 
-        def emit(code: Optional[int]) -> None:
-            if code is None:
+        def emit(key: KeyCode | None) -> None:
+            if key is None:
                 return
-            name = KEY_NAMES.get(code, f"KEY_{code}")
-            print(f"  -> {name}", flush=True)
-            if self.uinput:
-                self.uinput.tap(code)
+            self.logger.info("  -> Emitting %s", key.name)
+            if self._uinput:
+                self._uinput.tap(key)
 
-        def release_track():
-            nonlocal track, tracked_slot, grabbed
-            if grabbed:
-                try:
-                    fcntl.ioctl(fd, EVIOCGRAB, 0)
-                except OSError:
-                    pass
-                grabbed = False
-            track = None
-            tracked_slot = None
+        def release_gesture() -> None:
+            nonlocal gesture
+            self._set_device_grab(False)
+            gesture = None
 
-        def primary_slot() -> Optional[int]:
+        def primary_slot_id() -> int | None:
             for s in sorted(slots.keys()):
-                if slots[s].get("id") is not None:
+                if slots[s].tracking_id is not None:
                     return s
             return None
 
-        print(
-            f"asus-smart-gestures: listening on {self.device_path} ({self.device_name})\n"
-            f"  bounds X:[{self.x_min}..{self.x_max}] Y:[{self.y_min}..{self.y_max}] "
-            f"edge_x={self.edge_x} bottom_limit={self.bottom_limit} step_y={self.step_y}"
-            f"{' [DRY RUN]' if self.cfg.dry_run else ''}",
-            flush=True,
-        )
-
         try:
-            while True:
+            while self._running:
                 if deadline and time.monotonic() > deadline:
                     break
 
-                data = os.read(fd, SZ)
-                if len(data) < SZ:
+                try:
+                    data = os.read(self._fd, EVENT_SIZE)
+                except OSError as err:
+                    if self._running:
+                        self.logger.error("Read error on %s: %s", self.touchpad.path, err)
+                    break
+
+                if len(data) < EVENT_SIZE:
                     continue
-                _, _, etype, code, value = struct.unpack(FMT, data)
+
+                _, _, etype, code, value = struct.unpack(INPUT_EVENT_FMT, data)
 
                 if etype == EV_ABS:
                     if code == ABS_MT_SLOT:
@@ -162,88 +232,91 @@ class GestureDaemon:
                         if value == -1:
                             slots.pop(active_slot, None)
                         else:
-                            slots[active_slot] = {"id": value, "x": 0, "y": 0}
+                            slots[active_slot] = TouchSlot(tracking_id=value)
                     elif code == ABS_MT_POSITION_X:
-                        slots.setdefault(active_slot, {"id": None, "x": 0, "y": 0})["x"] = value
+                        slots.setdefault(active_slot, TouchSlot()).x = value
                     elif code == ABS_MT_POSITION_Y:
-                        slots.setdefault(active_slot, {"id": None, "x": 0, "y": 0})["y"] = value
+                        slots.setdefault(active_slot, TouchSlot()).y = value
 
                 elif etype == EV_SYN and code == SYN_REPORT:
-                    cur = primary_slot()
+                    cur_slot = primary_slot_id()
 
-                    # Finger lifted
-                    if track is not None and tracked_slot not in slots:
-                        release_track()
+                    # Active finger lifted
+                    if gesture is not None and gesture.slot_id not in slots:
+                        release_gesture()
 
                     # New finger down
-                    if track is None and cur is not None:
-                        sx = slots[cur].get("x", 0)
-                        sy = slots[cur].get("y", 0)
-                        tracked_slot = cur
+                    if gesture is None and cur_slot is not None:
+                        slot_data = slots[cur_slot]
+                        sx, sy = slot_data.x, slot_data.y
                         zone = self._determine_zone(sx, sy)
 
                         if event_callback:
-                            event_callback(zone or "center", sx, sy)
+                            event_callback(zone, sx, sy)
 
-                        track = {
-                            "zone": zone,
-                            "step_ref_y": sy,
-                            "step_ref_x": sx,
-                            "start_x": sx,
-                            "start_y": sy,
-                        }
+                        if zone != Zone.NONE:
+                            self.logger.info(
+                                "Touch start at (%d, %d) -> [%s EDGE]",
+                                sx,
+                                sy,
+                                zone.value.upper(),
+                            )
+                            self._set_device_grab(True)
+                            gesture = ActiveGesture(
+                                zone=zone,
+                                slot_id=cur_slot,
+                                step_ref_y=sy,
+                                step_ref_x=sx,
+                                start_x=sx,
+                                start_y=sy,
+                            )
 
-                        if zone:
-                            print(f"touch start ({sx}, {sy}) -> {zone}", flush=True)
-                            if not self.cfg.dry_run and not grabbed:
-                                try:
-                                    fcntl.ioctl(fd, EVIOCGRAB, 1)
-                                    grabbed = True
-                                except OSError:
-                                    pass
+                    # Continuous movement
+                    if gesture is not None and cur_slot == gesture.slot_id:
+                        slot_data = slots[cur_slot]
+                        cx, cy = slot_data.x, slot_data.y
 
-                    # Movement in progress
-                    if track is not None and cur == tracked_slot:
-                        x = slots[cur].get("x", 0)
-                        y = slots[cur].get("y", 0)
-                        zone = track["zone"]
+                        if gesture.zone in (Zone.LEFT, Zone.RIGHT):
+                            action = (
+                                self.cfg.left_edge_action
+                                if gesture.zone == Zone.LEFT
+                                else self.cfg.right_edge_action
+                            )
+                            invert = (
+                                self.cfg.invert_left
+                                if gesture.zone == Zone.LEFT
+                                else self.cfg.invert_right
+                            )
+                            pos_k, neg_k = self._resolve_keys(action, invert)
 
-                        if zone in ("left", "right"):
-                            action = self.cfg.left_edge_action if zone == "left" else self.cfg.right_edge_action
-                            invert = self.cfg.invert_left if zone == "left" else self.cfg.invert_right
-                            pos_key, neg_key = self._resolve_keys_for_action(action, invert)
-
-                            ref_y = track["step_ref_y"]
-                            # Finger moving UP (decreasing Y)
-                            while ref_y - y >= self.step_y:
-                                emit(pos_key)
+                            ref_y = gesture.step_ref_y
+                            # Slide UP (towards 0, decreasing Y)
+                            while ref_y - cy >= self.step_y:
+                                emit(pos_k)
                                 ref_y -= self.step_y
-                            # Finger moving DOWN (increasing Y)
-                            while y - ref_y >= self.step_y:
-                                emit(neg_key)
+                            # Slide DOWN (increasing Y)
+                            while cy - ref_y >= self.step_y:
+                                emit(neg_k)
                                 ref_y += self.step_y
-                            track["step_ref_y"] = ref_y
+                            gesture.step_ref_y = ref_y
 
-                        elif zone == "top":
-                            action = self.cfg.top_edge_action
-                            invert = self.cfg.invert_top
-                            pos_key, neg_key = self._resolve_keys_for_action(action, invert)
-
-                            ref_x = track["step_ref_x"]
-                            # Finger moving RIGHT (increasing X)
-                            while x - ref_x >= self.step_x:
-                                emit(pos_key)
+                        elif gesture.zone == Zone.TOP:
+                            pos_k, neg_k = self._resolve_keys(
+                                self.cfg.top_edge_action, self.cfg.invert_top
+                            )
+                            ref_x = gesture.step_ref_x
+                            # Slide RIGHT (increasing X)
+                            while cx - ref_x >= self.step_x:
+                                emit(pos_k)
                                 ref_x += self.step_x
-                            # Finger moving LEFT (decreasing X)
-                            while ref_x - x >= self.step_x:
-                                emit(neg_key)
+                            # Slide LEFT (decreasing X)
+                            while ref_x - cx >= self.step_x:
+                                emit(neg_k)
                                 ref_x -= self.step_x
-                            track["step_ref_x"] = ref_x
+                            gesture.step_ref_x = ref_x
 
         except KeyboardInterrupt:
-            pass
+            self.logger.info("Exiting cleanly on KeyboardInterrupt")
         finally:
-            release_track()
-            os.close(fd)
-            if self.uinput:
-                self.uinput.close()
+            self._cleanup()
+            atexit.unregister(self._cleanup)

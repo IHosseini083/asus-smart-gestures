@@ -1,78 +1,113 @@
-"""uinput virtual keyboard implementation for emitting media & brightness keys."""
+"""Context-managed virtual keyboard device via Linux uinput."""
 
 import fcntl
 import os
 import struct
 import time
-from typing import Iterable, Set
+from collections.abc import Iterable
+from contextlib import AbstractContextManager, suppress
+from pathlib import Path
+from types import TracebackType
 
-EV_SYN = 0x00
-EV_KEY = 0x01
-SYN_REPORT = 0x00
+from .constants import (
+    EV_KEY,
+    EV_SYN,
+    INPUT_EVENT_FMT,
+    SYN_REPORT,
+    UI_DEV_CREATE,
+    UI_DEV_DESTROY,
+    UI_SET_EVBIT,
+    UI_SET_KEYBIT,
+    KeyCode,
+)
+from .logging import get_logger
 
-UI_SET_EVBIT = 0x40045564
-UI_SET_KEYBIT = 0x40045565
-UI_DEV_CREATE = 0x5501
-UI_DEV_DESTROY = 0x5502
-
-# Standard Linux input keycodes (linux/input-event-codes.h)
-KEY_VOLUMEDOWN = 114
-KEY_VOLUMEUP = 115
-KEY_PREVIOUSSONG = 165
-KEY_NEXTSONG = 163
-KEY_PLAYPAUSE = 164
-KEY_BRIGHTNESSDOWN = 224
-KEY_BRIGHTNESSUP = 225
-
-FMT = "llHHi"
-
-KEY_NAMES = {
-    KEY_VOLUMEUP: "VOLUMEUP",
-    KEY_VOLUMEDOWN: "VOLUMEDOWN",
-    KEY_BRIGHTNESSUP: "BRIGHTNESSUP",
-    KEY_BRIGHTNESSDOWN: "BRIGHTNESSDOWN",
-    KEY_NEXTSONG: "NEXTSONG",
-    KEY_PREVIOUSSONG: "PREVIOUSSONG",
-    KEY_PLAYPAUSE: "PLAYPAUSE",
-}
+UINPUT_PATH = Path("/dev/uinput")
 
 
-class UInputDevice:
-    """Creates a virtual keyboard via Linux /dev/uinput."""
+class UInputDevice(AbstractContextManager["UInputDevice"]):
+    """Virtual keyboard device for emitting hardware multimedia and brightness keycodes."""
 
-    def __init__(self, name: str = "asus-smart-gestures", keys: Iterable[int] = ()):
-        self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
-        fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_KEY)
-        fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_SYN)
+    def __init__(
+        self,
+        name: str = "asus-smart-gestures",
+        keys: Iterable[KeyCode] | None = None,
+    ) -> None:
+        self._name = name
+        self._keys = set(keys) if keys is not None else set(KeyCode)
+        self._fd: int | None = None
+        self._open()
 
-        key_set: Set[int] = set(keys) if keys else set(KEY_NAMES.keys())
-        for k in key_set:
-            fcntl.ioctl(self.fd, UI_SET_KEYBIT, k)
+    def _open(self) -> None:
+        logger = get_logger()
+        if not UINPUT_PATH.exists():
+            raise FileNotFoundError(
+                "/dev/uinput does not exist. Ensure the uinput kernel module is loaded ('modprobe uinput')."
+            )
 
-        # struct uinput_user_dev (80 chars name, id, ff_effects_max, absmax/absmin)
-        dev = struct.pack(
-            "80sHHHHi" + "i" * 256,
-            name.encode(),
-            0x03, 0x1209,  # BUS_USB, vendor
-            0x330C, 1, 0,  # product, version, ff_effects_max
-            *([0] * 256),
+        try:
+            self._fd = os.open(UINPUT_PATH, os.O_WRONLY | os.O_NONBLOCK)
+        except PermissionError as err:
+            raise PermissionError(
+                "Permission denied opening /dev/uinput. Root privileges or uinput group access required."
+            ) from err
+
+        try:
+            fcntl.ioctl(self._fd, UI_SET_EVBIT, EV_KEY)
+            fcntl.ioctl(self._fd, UI_SET_EVBIT, EV_SYN)
+            for k in self._keys:
+                fcntl.ioctl(self._fd, UI_SET_KEYBIT, int(k))
+
+            dev = struct.pack(
+                "80sHHHHi" + "i" * 256,
+                self._name.encode("utf-8"),
+                0x03,  # BUS_USB
+                0x1209,  # Vendor ID
+                0x330C,  # Product ID
+                1,  # Version
+                0,  # ff_effects_max
+                *([0] * 256),
+            )
+            os.write(self._fd, dev)
+            fcntl.ioctl(self._fd, UI_DEV_CREATE)
+            time.sleep(0.15)
+            logger.debug("Virtual uinput keyboard created: %s", self._name)
+        except Exception:
+            self.close()
+            raise
+
+    def tap(self, code: KeyCode) -> None:
+        """Emit a key press followed immediately by release and synchronization."""
+        if self._fd is None:
+            raise RuntimeError("Cannot tap key: uinput device is closed")
+
+        key_int = int(code)
+        events = (
+            (EV_KEY, key_int, 1),
+            (EV_SYN, SYN_REPORT, 0),
+            (EV_KEY, key_int, 0),
+            (EV_SYN, SYN_REPORT, 0),
         )
-        os.write(self.fd, dev)
-        fcntl.ioctl(self.fd, UI_DEV_CREATE)
-        time.sleep(0.2)
-
-    def tap(self, code: int) -> None:
-        """Send key press, SYN, release, SYN."""
-        for t, c, v in (
-            (EV_KEY, code, 1), (EV_SYN, SYN_REPORT, 0),
-            (EV_KEY, code, 0), (EV_SYN, SYN_REPORT, 0),
-        ):
-            os.write(self.fd, struct.pack(FMT, 0, 0, t, c, v))
+        for ev_type, ev_code, ev_val in events:
+            payload = struct.pack(INPUT_EVENT_FMT, 0, 0, ev_type, ev_code, ev_val)
+            os.write(self._fd, payload)
 
     def close(self) -> None:
-        """Destroy virtual uinput device."""
-        try:
-            fcntl.ioctl(self.fd, UI_DEV_DESTROY)
-        except OSError:
-            pass
-        os.close(self.fd)
+        """Destroy virtual device and close descriptor."""
+        if self._fd is not None:
+            with suppress(OSError):
+                fcntl.ioctl(self._fd, UI_DEV_DESTROY)
+            with suppress(OSError):
+                os.close(self._fd)
+            self._fd = None
+
+    def __enter__(self) -> "UInputDevice":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        self.close()
