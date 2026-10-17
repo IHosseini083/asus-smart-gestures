@@ -155,4 +155,3 @@ printf "  • Service status  : systemctl status asus-smart-gestures\n"
 printf "  • Diagnostics     : asus-smart-gestures --doctor\n"
 printf "  • Calibration tool: sudo asus-smart-gestures --calibrate\n"
 printf "  • Configuration   : %s\n\n" "$CONF_DEST"
-EOF

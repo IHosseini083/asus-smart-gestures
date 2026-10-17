@@ -83,4 +83,3 @@ fi
 
 printf "\n${_GREEN}${_BOLD}=== Uninstallation Complete ===${_RESET}\n"
 printf "Touchpad has reverted to native Linux multitouch driver behavior.\n\n"
-EOF
