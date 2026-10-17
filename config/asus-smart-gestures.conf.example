@@ -1,0 +1,34 @@
+# ASUS Smart Gestures Configuration File
+# Location: /etc/asus-smart-gestures.conf or ~/.config/asus-smart-gestures/config.conf
+
+[general]
+# Specific device path (leave blank or commented for auto-detection)
+# device = /dev/input/event10
+dry_run = false
+log_level = INFO
+
+[zones]
+# Width of the left and right edge slider strips as percentage of pad width
+edge_x_percent = 7.0
+
+# Bottom area percentage to ignore (prevents interfering with physical clickpad clicks)
+bottom_ignore_percent = 15.0
+
+# Vertical travel distance (as percentage of pad height) required to trigger one step
+step_travel_percent = 4.0
+
+# Optional top edge slider (for media track scrubbing / next / previous)
+enable_top_edge = false
+top_edge_percent = 8.0
+top_step_travel_percent = 5.0
+
+[actions]
+# Supported actions: volume, brightness, media, none
+left_edge = volume
+right_edge = brightness
+top_edge = media
+
+# Invert slide direction (default: sliding UP increases, sliding DOWN decreases)
+invert_left = false
+invert_right = false
+invert_top = false

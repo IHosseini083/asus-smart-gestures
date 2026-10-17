@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "asus-smart-gestures"
+version = "0.2.0"
+description = "ASUS touchpad edge-slide gesture daemon for Linux (volume, brightness, media)"
+readme = "README.md"
+authors = [{ name = "Iliya" }]
+license = { text = "MIT" }
+requires-python = ">=3.8"
+keywords = ["asus", "touchpad", "gestures", "linux", "volume", "brightness"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Hardware",
+]
+
+[project.scripts]
+asus-smart-gestures = "asus_smart_gestures.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["asus_smart_gestures*"]
