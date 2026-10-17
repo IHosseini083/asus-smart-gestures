@@ -1,6 +1,6 @@
 [Unit]
 Description=ASUS Smart Gestures Daemon (Touchpad edge-slide volume and brightness)
-Documentation=https://github.com/
+Documentation=https://github.com/IHosseini083/asus-smart-gestures
 After=multi-user.target systemd-modules-load.service
 Wants=systemd-modules-load.service
 ConditionPathExists=/dev/uinput

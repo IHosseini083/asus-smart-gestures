@@ -87,7 +87,7 @@ Works on any ASUS laptop featuring an internal multitouch trackpad:
 ### 1. One-Step Installer (Recommended)
 
 ```bash
-git clone https://github.com/your-username/asus-smart-gestures.git
+git clone https://github.com/IHosseini083/asus-smart-gestures.git
 cd asus-smart-gestures
 sudo ./install.sh
 ```

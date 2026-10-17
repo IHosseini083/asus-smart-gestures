@@ -8,7 +8,7 @@ Thank you for helping improve `asus-smart-gestures`! Contributions for new lapto
 
 1. **Clone the repository**:
    ```bash
-   git clone https://github.com/your-username/asus-smart-gestures.git
+   git clone https://github.com/IHosseini083/asus-smart-gestures.git
    cd asus-smart-gestures
    ```
 

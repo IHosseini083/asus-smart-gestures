@@ -26,6 +26,11 @@ classifiers = [
     "Topic :: System :: Hardware",
 ]
 
+[project.urls]
+Homepage = "https://github.com/IHosseini083/asus-smart-gestures"
+Repository = "https://github.com/IHosseini083/asus-smart-gestures"
+Issues = "https://github.com/IHosseini083/asus-smart-gestures/issues"
+
 [project.scripts]
 asus-smart-gestures = "asus_smart_gestures.cli:main"
 
